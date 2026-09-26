@@ -1,0 +1,8 @@
+# A DDEV/Drupal project built by following docs/cloud-environment.md or
+# docs/self-hosted-runner.md lives here temporarily (it's rebuilt fresh each
+# session and was never meant to be committed).
+/.ddev/
+/web/
+/vendor/
+/composer.json
+/composer.lock
