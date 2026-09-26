@@ -18,10 +18,11 @@ a real URL).
 Both guides work through the same worked example: DDEV's own
 [Drupal 11 quickstart](https://docs.ddev.com/en/stable/users/quickstart/#drupal),
 a minimal `drupal/recommended-project` install. Neither guide nor this repo
-commits that project's files — each guide's first-run steps build it fresh
-in the checkout, so the pattern applies to any DDEV-managed PHP project. Where
-a step is genuinely project-specific (a project name, a docroot, an install
-profile), swap in your own.
+commits that project's files. The cloud guide builds it fresh in the checkout;
+the self-hosted guide builds it in a persistent sibling directory so runner
+branch resets cannot alter it. The pattern applies to any DDEV-managed PHP
+project. Where a step is genuinely project-specific (a project name, a
+docroot, an install profile), swap in your own.
 
 ## Does an environment need a repository?
 

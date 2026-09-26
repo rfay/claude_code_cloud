@@ -12,6 +12,18 @@ swap in your own project's setup where it differs.
 For the Anthropic-hosted sandbox this repo also documents, and its limits,
 see [`cloud-environment.md`](cloud-environment.md).
 
+## Suggested prompt
+
+After completing the administrative setup below and starting a session, give
+Claude this prompt:
+
+```text
+Follow docs/self-hosted-runner.md to set up and test the DDEV/Drupal example.
+Run the commands you can run, report the result of each validation, and ask me
+to perform any action that requires the Claude web UI, an administrator role,
+or a secret. Do not commit generated DDEV or throwaway Drupal project files.
+```
+
 ## Why self-host
 
 The Anthropic-hosted sandbox works, but it's restrictive:
@@ -73,33 +85,34 @@ Owner walks through these steps interactively.
 
 ### 3. Prepare the workspace
 
-In a workspace terminal, as the workspace user:
+The required runner files are versioned in
+[`scripts/self-hosted-runner/`](../scripts/self-hosted-runner/), not embedded
+in this guide. In a workspace terminal, as the workspace user, first store the
+environment key (this is the only manual file creation):
 
 ```bash
-claude self-hosted-runner --help     # should list --environment-secret-file
-
-# Store the environment key, readable only by you
 mkdir -p ~/.claude-runner
 (umask 077 && cat > ~/.claude-runner/environment-secret)   # paste, Enter, Ctrl-D
-
-# Trust DDEV's local CA. Needed before the first `ddev start` so the router
-# gets trusted certificates, and again after every workspace restart
-# (the startup script below does that).
-mkcert -install
-
-# Git identity and ignores for sessions (see below). startup.sh installs
-# this file as /etc/gitconfig on every boot.
-cat > ~/.claude-runner/gitconfig <<'EOF'
-[user]
-	name = Claude
-	email = noreply@anthropic.com
-[core]
-	excludesFile = ~/.claude-runner/gitignore
-EOF
-printf '%s\n' .ddev/config.coder.yaml .ddev/docker-compose.coder-describe.yaml \
-  > ~/.claude-runner/gitignore
-sudo install -m 644 ~/.claude-runner/gitconfig /etc/gitconfig
 ```
+
+Then, from a checkout of this repository on the workspace, run the one
+installer. On a new workspace, clone the repository first; this bootstrap
+checkout becomes the runner's reusable checkout after its first session. Pass
+the DDEV project name registered in `CODER_PROJECT_NAMES`; `d11` is the worked
+example:
+
+```bash
+mkdir -p ~/workspace/<owner>
+git clone https://github.com/<owner>/claude_code_cloud.git ~/workspace/<owner>/claude_code_cloud
+cd ~/workspace/<owner>/claude_code_cloud
+scripts/self-hosted-runner/setup.sh d11
+```
+
+The installer verifies the required commands, installs the runner loop, startup
+hook, Git config and DDEV ignore list under `~/.claude-runner/`, trusts the
+mkcert CA, restores `/etc/gitconfig`, and starts the runner now. It also
+installs `~/.coder-startup.sh`, which repeats the startup work automatically
+after every workspace restart.
 
 Why `/etc/gitconfig` and not `git config --global`: with
 `--use-anthropic-git-proxy`, the runner **wipes `~/.gitconfig` and
@@ -122,27 +135,11 @@ startup script reinstalls it after each workspace restart.
   untracked in `git status`, where a session might commit them.
   `core.excludesFile` points git at a copy that lives outside the wiped paths.
 
-### 4. The runner script
+### 4. Runner configuration
 
-The runner exits by design when its sessions finish, so it needs a restart
-loop. Save this as `~/.claude-runner/run.sh` and `chmod +x` it:
-
-```bash
-#!/bin/bash
-# Keep a Claude Code self-hosted runner running for one project.
-while true; do
-  claude self-hosted-runner \
-    --environment-secret-file "$HOME/.claude-runner/environment-secret" \
-    --base-dir "$HOME/workspace" \
-    --capacity 1 \
-    --use-anthropic-git-proxy \
-    --release-idle-session-min 30 \
-    --kill-session-after-min 480 \
-    --health-port 0
-  echo "runner exited ($?); restarting in 5s"
-  sleep 5
-done
-```
+The installer copies [`run.sh`](../scripts/self-hosted-runner/run.sh) to
+`~/.claude-runner/run.sh`. The runner exits by design when its sessions finish,
+so that versioned file keeps it in a restart loop with these flags:
 
 What the flags do:
 
@@ -157,11 +154,11 @@ What the flags do:
 - `--capacity 1`: one session at a time.
   - `--use-anthropic-git-proxy` requires it.
   - At capacity 1 the runner keeps one reusable checkout and **resets it to
-    each session's branch**. So the DDEV project is always the same project,
-    and its database carries over between sessions. But don't keep
-    workspace-only files in the checkout: they disappear when a session uses a
-    branch that doesn't have them. That's why the scripts here live in
-    `~/.claude-runner/`.
+    each session's branch**. Do not put a workspace-only DDEV project in that
+    checkout: it can disappear when a session uses a branch that does not have
+    it. The worked example instead uses a persistent sibling directory such as
+    `~/workspace/d11`, so its DDEV database carries over between sessions.
+    The runner scripts live in `~/.claude-runner/` for the same reason.
   - With a higher capacity, parallel checkouts of the same repository would
     all be DDEV projects with the same name and collide.
 - `--use-anthropic-git-proxy`: clone and push through Anthropic's git proxy,
@@ -173,87 +170,27 @@ What the flags do:
   never-ending background task (a `ddev share` tunnel, for example) never
   counts as idle.
 
-### 5. The startup script
+### 5. Workspace-start behavior
 
-Workspace restarts stop every process, and the system trust store is on the
-ephemeral root filesystem. Save this as `~/.claude-runner/startup.sh` and
-`chmod +x` it. It trusts the mkcert CA, starts the runner loop in a tmux
-session, and starts DDEV. It does this at most once per workspace boot. If
-`~/.claude-runner/environment-secret` doesn't exist, it does nothing and logs
-that the one-time setup is needed:
+The installer copies [`startup.sh`](../scripts/self-hosted-runner/startup.sh)
+and [`coder-startup.sh`](../scripts/self-hosted-runner/coder-startup.sh) into
+the workspace. `startup.sh` trusts mkcert, restores `/etc/gitconfig`, starts
+the runner in tmux, and starts the configured DDEV project at most once per
+workspace boot. Before the throwaway DDEV project exists, its failed `ddev
+start` is expected and does not stop the runner.
 
-```bash
-#!/usr/bin/env bash
-# Start a runner workspace: mkcert CA, runner loop (tmux), DDEV.
-# Safe to call repeatedly: it only does work once per workspace boot.
-set -u
+All current coder.ddev.com templates run an executable `~/.coder-startup.sh`
+automatically on every workspace start, after Docker and DDEV are ready. No
+terminal, VS Code session, or SSH login is needed. The hook is detached, so it
+cannot delay or fail workspace startup; its output goes to
+`/tmp/coder-startup-user.log`.
 
-PROJECT_NAME=<project>   # your DDEV project's name, e.g. your repo's directory name
-
-log=/tmp/claude-runner-startup.log
-# No environment key yet: the one-time setup (steps 2-4) hasn't been done.
-# Checked before the marker, so the next terminal retries once it has.
-if [ ! -f "$HOME/.claude-runner/environment-secret" ]; then
-  echo "$(date): no ~/.claude-runner/environment-secret; do the one-time setup first" >>"$log"
-  exit 0
-fi
-
-marker=/tmp/.claude-runner-startup-done   # /tmp is wiped on workspace restart
-[ -e "$marker" ] && exit 0
-touch "$marker"
-exec >>"$log" 2>&1
-echo "=== startup $(date)"
-
-# The CA in ~/.local/share/mkcert persists; the system trust store doesn't.
-mkcert -install
-
-# Git identity and ignores for sessions. /etc is on the ephemeral root
-# filesystem, and the runner wipes ~/.gitconfig and ~/.config/git (step 3).
-if [ -f "$HOME/.claude-runner/gitconfig" ]; then
-  sudo install -m 644 "$HOME/.claude-runner/gitconfig" /etc/gitconfig
-fi
-
-if ! pgrep -f '^claude self-hosted-runner' >/dev/null; then
-  tmux new-session -d -s claude-runner "$HOME/.claude-runner/run.sh"
-fi
-
-# Fails with "could not find requested project '$PROJECT_NAME'" until the
-# first session has cloned the repository and run `ddev start` there (step 6).
-ddev start "$PROJECT_NAME" -y || { sleep 5; ddev start "$PROJECT_NAME" -y; }
-```
-
-The first time it runs, before any session has cloned the repository,
-`ddev start "$PROJECT_NAME"` fails with `could not find requested project
-'<project>'` (twice, because of the retry). That's expected; the rest of the
-script has already run. After step 6 it starts the project normally.
-
-Run it from `~/.bashrc` so it starts when you open a terminal:
-
-```bash
-echo '[ -x ~/.claude-runner/startup.sh ] && (~/.claude-runner/startup.sh &)' >> ~/.bashrc
-```
-
-`~/.bashrc` only runs when an interactive shell starts: a VS Code terminal,
-the web terminal, or `coder ssh`. After a workspace restart, **nothing runs
-until someone opens a terminal**.
-
-A workspace template can run a user startup hook instead: a template that runs
-`~/.coder-startup.sh` (if it's executable) at every workspace start
-([ddev/coder-ddev#208](https://github.com/ddev/coder-ddev/pull/208), not
-merged yet) starts the runner with no terminal open:
-
-```bash
-printf '#!/usr/bin/env bash\nexec "$HOME/.claude-runner/startup.sh"\n' > ~/.coder-startup.sh
-chmod +x ~/.coder-startup.sh
-```
-
-Tested on a staging workspace: after a restart with no terminal open, the
-runner registered and picked up a session. The hook's own output goes to
-`/tmp/coder-startup-user.log`; `startup.sh` still logs to
-`/tmp/claude-runner-startup.log`.
-
-Now start it: open a new terminal, or run `~/.claude-runner/startup.sh`. Watch
-the runner with `tmux attach -t claude-runner` (detach with Ctrl-b d).
+The hook is provided by
+[ddev/coder-ddev#208](https://github.com/ddev/coder-ddev/pull/208). It has an
+explicit PATH that includes the Homebrew `claude` binary. `startup.sh` still
+logs its own work to `/tmp/claude-runner-startup.log`. The installer starts the
+runner immediately; watch it with `tmux attach -t claude-runner` (detach with
+Ctrl-b d).
 
 ### 6. First session and project setup
 
@@ -264,22 +201,22 @@ the runner with `tmux attach -t claude-runner` (detach with Ctrl-b d).
 3. The runner logs `Picked up session <session-id>` and clones the repository
    to `~/workspace/<owner>/<repo>`.
 
-Once the checkout exists, set up the DDEV project once (in the session or a
-terminal):
+The checkout anchors the Claude session; keep the throwaway DDEV project out
+of it. Once the checkout exists, set up the DDEV project once in a persistent
+sibling directory (in the session or a terminal):
 
 ```bash
-cd ~/workspace/<owner>/<repo>
-ddev coder-setup    # before the first ddev start
+PROJECT_DIR="$HOME/workspace/d11"   # choose a name registered in CODER_PROJECT_NAMES
+mkdir -p "$PROJECT_DIR"
+cd "$PROJECT_DIR"
 
-# If the repo doesn't already carry a DDEV project, build the quickstart:
-ddev config --project-type=drupal11 --docroot=web --create-docroot
+# Build the quickstart:
+ddev config --project-type=drupal11 --docroot=web
+ddev coder-setup    # after config, before the first ddev start
 ddev start
 ddev composer create-project drupal/recommended-project
 ddev composer require drush/drush
-ddev drush site:install --account-name=admin --account-pass=admin -y   # first time only; the database persists
-
-# If it already does, just:
-ddev start
+ddev drush site:install demo_umami --account-name=admin --account-pass=admin -y   # first time only; the database persists
 ```
 
 `ddev coder-setup` writes `.ddev/config.coder.yaml` and
@@ -307,7 +244,7 @@ wrapper, no CA files, no setup script. Run `ddev` normally in
 
 - **Logging in:** `ddev drush uli`.
 - If your project has its own install profile or config-import flow, use
-  that instead of the plain `drush site:install` above.
+  that instead of the `drush site:install demo_umami` command above.
 
 Seeing the site:
 
@@ -379,11 +316,10 @@ Seeing the site:
   `mkcert -install`, then `ddev restart`. For Chromium or Playwright in the
   workspace, create `~/.pki/nssdb` first (see
   [Seeing the site](#working-with-ddev-in-a-runner-session)).
-- **Steps 3 and 5 were only partly done** (for example, the runner was started
-  by hand with `run.sh` and there's no `startup.sh`): after a workspace
-  restart there's no `/etc/gitconfig` and the mkcert CA isn't trusted. Rerun
-  `sudo install -m 644 ~/.claude-runner/gitconfig /etc/gitconfig` and
-  `mkcert -install`, then set up `startup.sh` so it doesn't happen again.
+- **The workspace bootstrap was only partly done:** rerun
+  `scripts/self-hosted-runner/setup.sh <project-name>` from this repository's
+  checkout. It restores `/etc/gitconfig`, trusts the mkcert CA, and installs
+  the automatic workspace-start hook.
 - **Site redirects to `/core/install.php`:** the database is empty; install
   Drupal as above.
 - **`Author identity unknown` on commit:** `/etc/gitconfig` is missing (the
@@ -397,10 +333,10 @@ Seeing the site:
 - **`could not find requested project '<project>'` in
   `/tmp/claude-runner-startup.log`:** normal before the first session has
   cloned the repository and run `ddev start` in it.
-- **Nothing is running after a workspace restart:** open a terminal (see the
-  startup script above), or run `~/.claude-runner/startup.sh`. Its log is
-  `/tmp/claude-runner-startup.log`. If it says there is no
-  `environment-secret`, do steps 2–4 first.
+- **Nothing is running after a workspace restart:** check that
+  `~/.coder-startup.sh` is executable and inspect
+  `/tmp/coder-startup-user.log` and `/tmp/claude-runner-startup.log`. If the
+  latter says there is no `environment-secret`, do steps 2–4 first.
 
 ## Caveats
 

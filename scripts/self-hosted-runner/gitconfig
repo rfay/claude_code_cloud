@@ -1,0 +1,5 @@
+[user]
+	name = Claude
+	email = noreply@anthropic.com
+[core]
+	excludesFile = ~/.claude-runner/gitignore

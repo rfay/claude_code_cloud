@@ -7,6 +7,18 @@ The worked example is DDEV's own trivial
 [Drupal 11 quickstart](https://docs.ddev.com/en/stable/users/quickstart/#drupal);
 swap in your own project's setup where it differs.
 
+## Suggested prompt
+
+After creating the environment below and starting a session, give Claude this
+prompt:
+
+```text
+Follow docs/cloud-environment.md to set up and test the DDEV/Drupal example.
+Run the commands you can run, report the result of each validation, and ask me
+to perform any action that requires the Claude web UI, an administrator role,
+or a secret. Do not commit the throwaway Drupal project files.
+```
+
 The site is reachable **only from inside the cloud container**. Nothing can
 connect in, and `ddev share` doesn't work (see [What doesn't work](#what-doesnt-work)).
 So the practical ways to look at the site are:
@@ -232,11 +244,11 @@ If your repository doesn't already carry a DDEV project, build DDEV's
 Drupal 11 quickstart in the checkout:
 
 ```bash
-ddev config --project-type=drupal11 --docroot=web --create-docroot
+ddev config --project-type=drupal11 --docroot=web
 ddev start                                                  # a minute or two the first time
 ddev composer create-project drupal/recommended-project
 ddev composer require drush/drush
-ddev drush site:install --account-name=admin --account-pass=admin -y
+ddev drush site:install demo_umami --account-name=admin --account-pass=admin -y
 ```
 
 If your repository already has a DDEV project, just:
@@ -251,8 +263,9 @@ a config import, a database load, ...).
 `ddev start`, `ddev restart` and `ddev utility rebuild` can take minutes; Claude
 should run them in the background with output going to a log file.
 
-The login above is `admin` / `admin`. That's fine here because nobody outside
-the container can reach the site.
+The login above is `admin` / `admin`. The `demo_umami` profile gives the
+example a populated front page and demo content. The weak password is fine
+here because nobody outside the container can reach the site.
 
 ## 4. Using curl
 
@@ -269,9 +282,9 @@ The session's tools send traffic through an agent proxy (`$HTTPS_PROXY`,
 CA="$(sudo -u ubuntu -H mkcert -CAROOT)/rootCA.pem"   # /home/ubuntu/.local/share/mkcert/rootCA.pem
 site() { curl --noproxy '*' --cacert "$CA" -sS "$@"; }
 
-site -o /dev/null -w '%{http_code} %{time_total}s\n' https://<project>.ddev.site/
+site --fail-with-body -o /dev/null -w '%{http_code} %{time_total}s\n' https://<project>.ddev.site/
 site -I https://<project>.ddev.site/ | grep -iE '^(HTTP|x-drupal-cache|x-generator)'
-site https://<project>.ddev.site/node/1 | grep -o '<title>.*</title>'
+site https://<project>.ddev.site/ | grep -o '<title>.*</title>'
 site https://<project>.ddev.site:8026/api/v1/messages                          # Mailpit API (JSON)
 ```
 
@@ -382,4 +395,3 @@ blocked this way.
 | curl: `SSL certificate problem: unable to get local issuer certificate` | Missing `--cacert` for the mkcert root. |
 | Every page redirects to `/core/install.php` | Drupal isn't installed yet; run the `drush site:install` command above. |
 | Git "dubious ownership" | `git config --system --add safe.directory /workspace/<repo>` (the script does this). |
-| `ddev config`: docroot does not exist | Add `--create-docroot` (only needed the first time, before Composer creates `web/`). |
