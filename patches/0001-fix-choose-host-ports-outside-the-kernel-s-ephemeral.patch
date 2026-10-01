@@ -1,0 +1,453 @@
+From 072f0da62ca0e51de3a43e2faa02b5b0066c4991 Mon Sep 17 00:00:00 2001
+From: Randy Fay <randy.fay@ddev.com>
+Date: Thu, 1 Oct 2026 16:59:07 +0000
+Subject: [PATCH] fix: choose host ports outside the kernel's ephemeral range
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+## Short Summary (TL;DR)
+
+DDEV now picks the host port for every published container port that leaves it empty, such as the db port or web 80/443, instead of letting Docker or Podman pick one from the kernel's ephemeral range. This removes the `rootlessport listen tcp 127.0.0.1:NNNNN: bind: address already in use` flakes seen in the Podman rootless tests. The router's substitute ports move out of that range too.
+
+## The Issue
+
+When a compose port such as `127.0.0.1::3306` has no host port, the engine picks one from the kernel's ephemeral range (32768-60999 on Linux), which every outgoing connection also draws its source port from. Rootless Podman picks the port when the container is created but only binds it at start, so an unrelated socket can take it in between and the start fails. This hit `TestLastStartedVersionUpdatedByAnyStart`, `TestRouterNotRebuiltWithExtraPorts` and `TestTraefikSharedTLDCerts` in the Podman rootless workflow.
+
+## How This PR Solves The Issue
+
+`fixupComposeYaml` fills in every empty published TCP port, in DDEV's own services and in add-on or custom compose files, with a port from 20000-29999, which is below the ephemeral range on Linux, macOS and Windows. A candidate is checked by binding it, and ports bound by any DDEV container, stopped ones included, are skipped, as are ports reserved by other projects and ports already handed out in this process. An existing container's port is reused, so a running or stopped container isn't recreated just to change port, and the scan starts at a random offset so concurrent starts are unlikely to collide. On a remote Docker host, or when the bind address can't be checked locally, the engine still chooses. Locking concurrent `ddev` processes is left to #5527.
+
+The router's substitute port range moves from 33000-35000 to 30000-32000 for the same reason.
+
+## Manual Testing Instructions
+
+```bash
+ddev config --project-type=php
+ddev start
+docker ps --format '{{.Names}} {{.Ports}}'
+# Expect the db and web (80, 443, 8025) host ports in 20000-29999
+ddev start
+docker ps --format '{{.Names}} {{.ID}} {{.Ports}}'
+# Expect the same ports, and the db container not recreated
+```
+
+## Automated Testing Overview
+
+`pkg/netutil/netutil_test.go` covers `IsHostPortFree` and `AllocateHostPort`: busy and skipped ports are passed over, and an address that isn't local returns no port. The existing router tests cover the moved substitute range.
+
+## Release/Deployment Notes
+
+Projects whose db, web or Mailpit host port was chosen by the engine get a port in 20000-29999 after their containers are next created. Router substitute ports, shown as "Port 443 is not available, using ... instead", are now 30000-32000. Configured `host_*_port` values are unchanged.
+
+🤖 Developed with assistance from [Claude Code](https://claude.ai/code)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WaHCGCGbMSxBSZXQDkJZcd
+---
+ docs/content/users/usage/troubleshooting.md |   2 +-
+ pkg/ddevapp/compose_yaml.go                 |   4 +
+ pkg/ddevapp/host_ports.go                   | 136 ++++++++++++++++++++
+ pkg/ddevapp/router.go                       |   8 +-
+ pkg/ddevapp/router_test.go                  |   4 +-
+ pkg/dockerutil/containers.go                |  28 +++-
+ pkg/netutil/netutil.go                      |  38 ++++++
+ pkg/netutil/netutil_test.go                 |  58 +++++++++
+ 8 files changed, 265 insertions(+), 13 deletions(-)
+ create mode 100644 pkg/ddevapp/host_ports.go
+ create mode 100644 pkg/netutil/netutil_test.go
+
+diff --git a/docs/content/users/usage/troubleshooting.md b/docs/content/users/usage/troubleshooting.md
+index a488332..ca46cf7 100644
+--- a/docs/content/users/usage/troubleshooting.md
++++ b/docs/content/users/usage/troubleshooting.md
+@@ -60,7 +60,7 @@ If you're experiencing issues with Vite development servers (like "Bad Gateway"
+ On `ddev start` you may see a message like this:
+ 
+ ```bash
+-Port 443 is not available, using 33001 instead, see https://ddev.com/s/port-conflict
++Port 443 is not available, using 30001 instead, see https://ddev.com/s/port-conflict
+ ```
+ 
+ This means that DDEV has detected that it can't use the expected port (`443`) in this example, usually because another application is using it. (It can also mean the port was occupied when the `ddev-router` container was created, and DDEV keeps using the substitute port until the router is recreated, for example by `ddev poweroff && ddev start`.) If this is OK, you don't need to take any action. Most users want to use the default ports though (`80` and `443`) so you may want to figure out what the conflict is and solve it (usually by stopping the competing application).
+diff --git a/pkg/ddevapp/compose_yaml.go b/pkg/ddevapp/compose_yaml.go
+index 8564322..d7c9690 100644
+--- a/pkg/ddevapp/compose_yaml.go
++++ b/pkg/ddevapp/compose_yaml.go
+@@ -281,6 +281,7 @@ func fixupComposeYaml(project *composeTypes.Project, app *DdevApp) (*composeType
+ 	userGroup := uid + ":" + gid
+ 
+ 	hostDockerInternal := dockerutil.GetHostDockerInternal()
++	hostPorts := &hostPortAllocator{app: app}
+ 
+ 	// Ensure all services have required networks and environment variables
+ 	for name, service := range project.Services {
+@@ -333,6 +334,9 @@ func fixupComposeYaml(project *composeTypes.Project, app *DdevApp) (*composeType
+ 			if port.HostIP == "" {
+ 				port.HostIP = bindIP
+ 			}
++			if port.Published == "" {
++				port.Published = hostPorts.assignHostPort(name, port)
++			}
+ 			service.Ports[i] = port
+ 		}
+ 
+diff --git a/pkg/ddevapp/host_ports.go b/pkg/ddevapp/host_ports.go
+new file mode 100644
+index 0000000..afbd042
+--- /dev/null
++++ b/pkg/ddevapp/host_ports.go
+@@ -0,0 +1,136 @@
++package ddevapp
++
++import (
++	"fmt"
++	"net/netip"
++	"strconv"
++	"sync"
++
++	composeTypes "github.com/compose-spec/compose-go/v2/types"
++	"github.com/ddev/ddev/pkg/dockerutil"
++	"github.com/ddev/ddev/pkg/globalconfig"
++	"github.com/ddev/ddev/pkg/netutil"
++	"github.com/ddev/ddev/pkg/util"
++	"github.com/moby/moby/api/types/network"
++)
++
++// MinHostPort and MaxHostPort bound the host ports DDEV chooses for published
++// container ports that leave the host side empty, such as "127.0.0.1::3306".
++// Left empty, the engine picks from the kernel's ephemeral range, which
++// outgoing connections share, and rootless Podman doesn't bind until container
++// start, so the port can be taken in between. This range is below the
++// ephemeral range on Linux (32768+), macOS and Windows (49152+).
++const (
++	MinHostPort = 20000
++	MaxHostPort = 29999
++)
++
++var (
++	hostPortsMu sync.Mutex
++	// hostPortsAssigned holds every port this process handed out, so projects
++	// started together don't get the same port before their containers exist.
++	hostPortsAssigned = make(map[string]bool)
++	// hostPortChoices remembers the port chosen for each project service port,
++	// so rendering the compose file again in this process keeps the same port.
++	hostPortChoices = make(map[string]string)
++)
++
++// hostPortAllocator fills in host ports for one project's compose render.
++type hostPortAllocator struct {
++	app *DdevApp
++	// inUse holds host ports bound by existing DDEV containers, stopped ones
++	// included, since a stopped container binds its port again when started.
++	inUse map[string]bool
++}
++
++// assignHostPort returns the host port for a service port with an empty
++// published port, or "" to leave the choice to the engine.
++func (a *hostPortAllocator) assignHostPort(service string, p composeTypes.ServicePortConfig) string {
++	if (p.Protocol != "" && p.Protocol != "tcp") || dockerutil.IsRemoteDockerHost() {
++		return ""
++	}
++	key := fmt.Sprintf("%s/%s/%s/%d", a.app.GetName(), service, p.HostIP, p.Target)
++
++	// Reusing an existing container's port keeps compose's config hash stable,
++	// so a running or stopped container isn't recreated just to change port.
++	if port := a.existingContainerHostPort(service, p); port != "" {
++		hostPortsMu.Lock()
++		hostPortChoices[key] = port
++		hostPortsMu.Unlock()
++		return port
++	}
++
++	hostPortsMu.Lock()
++	defer hostPortsMu.Unlock()
++	if port, ok := hostPortChoices[key]; ok {
++		if portNum, _ := strconv.Atoi(port); netutil.IsHostPortFree(p.HostIP, portNum) {
++			return port
++		}
++	}
++
++	if a.inUse == nil {
++		a.inUse = ddevContainerHostPorts()
++	}
++	skip := func(port string) bool {
++		return hostPortsAssigned[port] || a.inUse[port] || globalconfig.HostPostIsAllocated(port) != ""
++	}
++	port := netutil.AllocateHostPort(p.HostIP, MinHostPort, MaxHostPort, skip)
++	if port == "" {
++		// A long-running process (the test suite) can hand out the whole range;
++		// ports it assigned earlier are protected by their containers by now.
++		port = netutil.AllocateHostPort(p.HostIP, MinHostPort, MaxHostPort, func(port string) bool {
++			return a.inUse[port] || globalconfig.HostPostIsAllocated(port) != ""
++		})
++	}
++	if port == "" {
++		util.Debug("No host port available for %s port %d in %d-%d, leaving it to the engine", service, p.Target, MinHostPort, MaxHostPort)
++		return ""
++	}
++	hostPortsAssigned[port] = true
++	hostPortChoices[key] = port
++	return port
++}
++
++// existingContainerHostPort returns the host port that this project's existing
++// container for service binds for p, or "".
++func (a *hostPortAllocator) existingContainerHostPort(service string, p composeTypes.ServicePortConfig) string {
++	c, err := a.app.FindContainerByType(service)
++	if err != nil || c == nil {
++		return ""
++	}
++	bindings, err := dockerutil.GetContainerPortBindings(c.ID)
++	if err != nil {
++		return ""
++	}
++	target, err := network.ParsePort(fmt.Sprintf("%d/tcp", p.Target))
++	if err != nil {
++		return ""
++	}
++	wantIP, _ := netip.ParseAddr(p.HostIP)
++	for _, b := range bindings[target] {
++		if b.HostPort != "" && (!b.HostIP.IsValid() || b.HostIP == wantIP) {
++			return b.HostPort
++		}
++	}
++	return ""
++}
++
++// ddevContainerHostPorts returns the host ports bound by all DDEV containers.
++func ddevContainerHostPorts() map[string]bool {
++	inUse := map[string]bool{}
++	containers, err := dockerutil.FindContainersWithLabel("com.ddev.site-name")
++	if err != nil {
++		util.Debug("Unable to list DDEV containers to check their host ports: %v", err)
++		return inUse
++	}
++	for _, c := range containers {
++		ports, err := dockerutil.GetBoundHostPorts(c.ID)
++		if err != nil {
++			continue
++		}
++		for _, port := range ports {
++			inUse[port] = true
++		}
++	}
++	return inUse
++}
+diff --git a/pkg/ddevapp/router.go b/pkg/ddevapp/router.go
+index 9480bd0..e0b045f 100644
+--- a/pkg/ddevapp/router.go
++++ b/pkg/ddevapp/router.go
+@@ -25,11 +25,13 @@ import (
+ 	"github.com/moby/moby/api/types/container"
+ )
+ 
+-// RouterComposeProjectName is the docker-compose project name of ~/.ddev/.router-compose.yaml
++// RouterComposeProjectName is the docker-compose project name of ~/.ddev/.router-compose.yaml.
++// MinEphemeralPort and MaxEphemeralPort bound the router's substitute ports, kept
++// below the kernel's ephemeral range for the same reason as MinHostPort.
+ const (
+ 	RouterComposeProjectName = "ddev-router"
+-	MinEphemeralPort         = 33000
+-	MaxEphemeralPort         = 35000
++	MinEphemeralPort         = 30000
++	MaxEphemeralPort         = 32000
+ )
+ 
+ // EphemeralRouterPortsAssigned is used when we have assigned an ephemeral port
+diff --git a/pkg/ddevapp/router_test.go b/pkg/ddevapp/router_test.go
+index 9811e5e..6addeb1 100644
+--- a/pkg/ddevapp/router_test.go
++++ b/pkg/ddevapp/router_test.go
+@@ -323,9 +323,9 @@ func TestUseEphemeralPort(t *testing.T) {
+ 			portNum, err := strconv.Atoi(p.port)
+ 			require.NoError(t, err)
+ 			require.GreaterOrEqual(t, portNum, ddevapp.MinEphemeralPort,
+-				"app %d (%s) %s port %d is below the ephemeral range", i, app.Name, p.scheme, portNum)
++				"app %d (%s) %s port %d is below the router substitute port range", i, app.Name, p.scheme, portNum)
+ 			require.LessOrEqual(t, portNum, ddevapp.MaxEphemeralPort,
+-				"app %d (%s) %s port %d is above the ephemeral range", i, app.Name, p.scheme, portNum)
++				"app %d (%s) %s port %d is above the router substitute port range", i, app.Name, p.scheme, portNum)
+ 			claimant := fmt.Sprintf("app %d (%s) %s", i, app.Name, p.scheme)
+ 			require.NotContains(t, assignedPorts, portNum,
+ 				"%s got port %d, which was already assigned to %s", claimant, portNum, assignedPorts[portNum])
+diff --git a/pkg/dockerutil/containers.go b/pkg/dockerutil/containers.go
+index 938cac0..8b3238c 100644
+--- a/pkg/dockerutil/containers.go
++++ b/pkg/dockerutil/containers.go
+@@ -926,30 +926,44 @@ func addBoundHostPorts(portMap map[string]bool, m network.PortMap) {
+ 	}
+ }
+ 
+-// GetBoundHostPorts takes a container pointer and returns an array
+-// of exposed ports (and error)
+-func GetBoundHostPorts(containerID string) ([]string, error) {
++// GetContainerPortBindings returns the host port bindings of a container,
++// whether or not it is running.
++func GetContainerPortBindings(containerID string) (network.PortMap, error) {
+ 	ctx, apiClient, err := GetDockerClient()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	inspectInfo, err := apiClient.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+-
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	portMap := map[string]bool{}
+-
+ 	if inspectInfo.Container.HostConfig != nil {
+ 		addBoundHostPorts(portMap, inspectInfo.Container.HostConfig.PortBindings)
++		if len(portMap) > 0 {
++			return inspectInfo.Container.HostConfig.PortBindings, nil
++		}
+ 	}
+ 	// HostConfig.PortBindings is the binding that was *requested*; providers that
+ 	// leave it empty on inspect (seen on socktainer/Apple Container) still report
+ 	// the ports actually bound in NetworkSettings.Ports, so fall back to that.
+-	if len(portMap) == 0 && inspectInfo.Container.NetworkSettings != nil {
+-		addBoundHostPorts(portMap, inspectInfo.Container.NetworkSettings.Ports)
++	if inspectInfo.Container.NetworkSettings != nil {
++		return inspectInfo.Container.NetworkSettings.Ports, nil
++	}
++	return nil, nil
++}
++
++// GetBoundHostPorts takes a container pointer and returns an array
++// of exposed ports (and error)
++func GetBoundHostPorts(containerID string) ([]string, error) {
++	bindings, err := GetContainerPortBindings(containerID)
++	if err != nil {
++		return nil, err
+ 	}
++
++	portMap := map[string]bool{}
++	addBoundHostPorts(portMap, bindings)
+ 	var ports []string
+ 	for k := range portMap {
+ 		ports = append(ports, k)
+diff --git a/pkg/netutil/netutil.go b/pkg/netutil/netutil.go
+index de302ab..72ad04d 100644
+--- a/pkg/netutil/netutil.go
++++ b/pkg/netutil/netutil.go
+@@ -2,10 +2,12 @@ package netutil
+ 
+ import (
+ 	"fmt"
++	"math/rand/v2"
+ 	"net"
+ 	"net/url"
+ 	"os"
+ 	"slices"
++	"strconv"
+ 	"strings"
+ 	"syscall"
+ 	"time"
+@@ -157,3 +159,39 @@ func NormalizeURL(rawURL string) string {
+ 
+ 	return parsedURL.String()
+ }
++
++// IsHostPortFree reports whether a TCP listener can bind ip:port right now.
++// It binds instead of dialing, so it also catches a port held by a socket that
++// isn't listening, such as the local end of an outgoing connection.
++func IsHostPortFree(ip string, port int) bool {
++	l, err := net.Listen("tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
++	if err != nil {
++		return false
++	}
++	_ = l.Close()
++	return true
++}
++
++// AllocateHostPort returns a port in [minPort, maxPort] that is free on ip and
++// not rejected by skip, scanning from a random offset so concurrent callers are
++// unlikely to try the same port first. It returns "" when ip can't be bound
++// locally (for example a remote Docker host), or when no port qualifies.
++func AllocateHostPort(ip string, minPort, maxPort int, skip func(port string) bool) string {
++	if !IsHostPortFree(ip, 0) {
++		util.Debug("AllocateHostPort: unable to bind %s locally, not choosing a host port", ip)
++		return ""
++	}
++	size := maxPort - minPort + 1
++	start := rand.IntN(size)
++	for i := range size {
++		port := minPort + (start+i)%size
++		portStr := strconv.Itoa(port)
++		if skip != nil && skip(portStr) {
++			continue
++		}
++		if IsHostPortFree(ip, port) {
++			return portStr
++		}
++	}
++	return ""
++}
+diff --git a/pkg/netutil/netutil_test.go b/pkg/netutil/netutil_test.go
+new file mode 100644
+index 0000000..c3b659e
+--- /dev/null
++++ b/pkg/netutil/netutil_test.go
+@@ -0,0 +1,58 @@
++package netutil_test
++
++import (
++	"net"
++	"strconv"
++	"testing"
++
++	"github.com/ddev/ddev/pkg/netutil"
++	"github.com/stretchr/testify/require"
++)
++
++// listenFreePorts finds n consecutive free ports on 127.0.0.1 and returns the first.
++func listenFreePorts(t *testing.T, n int) int {
++	for start := 23000; start < 29000; start += n {
++		ok := true
++		for p := start; p < start+n; p++ {
++			if !netutil.IsHostPortFree("127.0.0.1", p) {
++				ok = false
++				break
++			}
++		}
++		if ok {
++			return start
++		}
++	}
++	t.Fatalf("no %d consecutive free ports found", n)
++	return 0
++}
++
++func TestIsHostPortFree(t *testing.T) {
++	l, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = l.Close() })
++	port := l.Addr().(*net.TCPAddr).Port
++
++	require.False(t, netutil.IsHostPortFree("127.0.0.1", port))
++	require.NoError(t, l.Close())
++	require.True(t, netutil.IsHostPortFree("127.0.0.1", port))
++}
++
++func TestAllocateHostPort(t *testing.T) {
++	start := listenFreePorts(t, 3)
++
++	l, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(start))
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = l.Close() })
++
++	skipLast := func(port string) bool { return port == strconv.Itoa(start+2) }
++	for range 20 {
++		require.Equal(t, strconv.Itoa(start+1), netutil.AllocateHostPort("127.0.0.1", start, start+2, skipLast))
++	}
++
++	skipAll := func(port string) bool { return port != strconv.Itoa(start) }
++	require.Equal(t, "", netutil.AllocateHostPort("127.0.0.1", start, start+2, skipAll), "the only unskipped port is in use")
++
++	// 192.0.2.1 is reserved for documentation, so it is never a local address.
++	require.Equal(t, "", netutil.AllocateHostPort("192.0.2.1", start, start+2, nil))
++}
+-- 
+2.43.0
+
